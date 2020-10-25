@@ -80,13 +80,19 @@ function db_connect_real($device, $user, $pass, $db_name, $db_type = 'mysql', $p
 		}
 	}
 
+	if ($db_type == 'sqlite') {
+		$dsn = "$db_type:$device";
+	} else {
+		if (strpos($device, '/') !== false && filetype($device) == 'socket') {
+			$dsn = "$db_type:unix_socket=$device;dbname=$db_name;charset=utf8";
+		} else {
+			$dsn = "$db_type:host=$device;port=$port;dbname=$db_name;charset=utf8";
+		}
+	}
+
 	while ($i <= $retries) {
 		try {
-			if (strpos($device, '/') !== false && filetype($device) == 'socket') {
-				$cnn_id = new PDO("$db_type:unix_socket=$device;dbname=$db_name;charset=utf8", $user, $pass, $flags);
-			} else {
-				$cnn_id = new PDO("$db_type:host=$device;port=$port;dbname=$db_name;charset=utf8", $user, $pass, $flags);
-			}
+			$cnn_id = new PDO($dsn, $user, $pass, $flags);
 			$cnn_id->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_SILENT);
 
 			$bad_modes = array(
@@ -256,19 +262,26 @@ function db_execute_prepared($sql, $params = array(), $log = true, $db_conn = fa
 			db_echo_sql('db_' . $execute_name . ' Memory [Before]: ' . memory_get_usage() . ' / ' . memory_get_peak_usage() . "\n");
 		}
 
-		set_error_handler('db_warning_handler',E_WARNING | E_NOTICE);
-		try {
-			if (empty($params) || cacti_count($params) == 0) {
-				$query->execute();
-			} else {
-				$query->execute($params);
-			}
-		} catch (Exception $ex) {
-			$code = $ex->getCode();
+		if ($query === false) {
+			$errorinfo = $db_conn->errorInfo();
+			$code = $errorinfo[1];
 			$en = $code;
-			$errorinfo = array(1=>$code, 2=>$ex->getMessage());
+			unset($query);
+		} else {
+			set_error_handler('db_warning_handler',E_WARNING | E_NOTICE);
+			try {
+				if (empty($params) || cacti_count($params) == 0) {
+					$query->execute();
+				} else {
+					$query->execute($params);
+				}
+			} catch (Exception $ex) {
+				$code = $ex->getCode();
+				$en = $code;
+				$errorinfo = array(1=>$code, 2=>$ex->getMessage());
+			}
+			restore_error_handler();
 		}
-		restore_error_handler();
 
 		if (!empty($config['DEBUG_SQL_CMD'])) {
 			db_echo_sql('db_' . $execute_name . ' Memory [ After]: ' . memory_get_usage() . ' / ' . memory_get_peak_usage() . "\n");
@@ -862,6 +875,31 @@ function db_table_exists($table, $log = true, $db_conn = false) {
 	return false;
 }
 
+function db_cacti_sql_init() {
+	global $database_hostname, $database_type;
+
+	$file = __DIR__ . '/../cacti.sql';
+	if ($database_type == 'sqlite' && file_exists("$file+sqlite")) {
+		$sql = file_get_contents("$file+sqlite");
+	} elseif ($database_type == 'sqlite') {
+		$sql = file_get_contents($file);
+		// HACK: Try to convert MySQL to SQLite
+		$sql = substr($sql, strpos($sql, '-- GENERIC START'));
+		$sql = str_ireplace(array(' unsigned', 'ENGINE=InnoDB', 'ENGINE=MEMORY', 'ROW_FORMAT=Dynamic', ' USING BTREE', ' COLLATE utf8mb4_unicode_ci'), array('', '', '', '', '', ''), $sql);
+		$sql = preg_replace('/CURRENT_TIMESTAMP\(\)/i', 'CURRENT_TIMESTAMP', $sql);
+		$sql = preg_replace('/ON UPDATE CURRENT_TIMESTAMP/i', '', $sql);
+		$sql = preg_replace('/COMMENT[= ]\x27.*?\x27/', '', $sql);
+		$sql = preg_replace('/\S+ NOT NULL AUTO_INCREMENT/i', 'INTEGER PRIMARY KEY AUTOINCREMENT', $sql);
+		$sql = preg_replace('/PRIMARY KEY \(`?id`?(,.*?)?\),?\n?/i', '', $sql);
+		$sql = preg_replace('/(PRIMARY KEY \([^\)]+)\(\d+\)/i', '\1', $sql);
+		$sql = preg_replace('/(UNIQUE )?KEY `?\w+`?\s*\(.*?\D\),?\n?/i', '', $sql);
+		$sql = preg_replace('/,(\s+\))/', '\1', $sql);
+	} else {
+		$sql = file_get_contents($file);
+	}
+	return $sql;
+}
+
 /* db_cacti_initialized - checks whether cacti has been initialized properly and if not exits with a message
    @param $is_web - is the session a web session.
    @returns - (null)  */
@@ -874,10 +912,19 @@ function db_cacti_initialized($is_web = true) {
 		return false;
 	}
 
-	$query = $db_conn->prepare('SELECT cacti FROM version');
-	$query->execute();
-	$errorinfo = $query->errorInfo();
-	$query->closeCursor();
+	$sql = 'SELECT cacti FROM version';
+	$query = $db_conn->prepare($sql);
+	if ($query === false && $database_hostname == ':memory:') {
+		$sql = db_cacti_sql_init();
+		$db_conn->exec($sql);
+		$errorinfo = $db_conn->errorInfo();
+	} elseif ($query === false) {
+		$errorinfo = $db_conn->errorInfo();
+	} else {
+		$query->execute();
+		$errorinfo = $query->errorInfo();
+		$query->closeCursor();
+	}
 
 	if ($errorinfo[1] != 0) {
 		print ($is_web ? '<head><link href="' . $config['url_path'] . 'include/themes/modern/main.css" type="text/css" rel="stylesheet"></head>':'');
@@ -893,6 +940,10 @@ function db_cacti_initialized($is_web = true) {
 		print ($is_web ? '<p>':'') . 'Where <b>/pathcacti/</b> is the path to your Cacti install location.' . ($is_web ? '</p>':"\n");
 		print ($is_web ? '<p>':'') . 'Change <b>someuser</b> and <b>somepassword</b> to match your site preferences.  The defaults are <b>cactiuser</b> for both user and password.' . ($is_web ? '</p>':"\n");
 		print ($is_web ? '<p>':'') . '<b>NOTE:</b> When installing a remote poller, the <b>config.php</b> file must be writable by the Web Server account, and must include valid connection information to the main Cacti server.  The file should be changed to read only after the install is completed.' . ($is_web ? '</p>':"\n");
+		if (!$is_web) {
+			print $errorinfo[2] . "\n";
+			print $sql . "\n";
+		}
 		print ($is_web ? '</td></tr></table>':'');
 		exit;
 	}

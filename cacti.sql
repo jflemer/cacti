@@ -60,6 +60,8 @@ SET @sqlmode= "";
 SELECT IF(NOAUTOCREATENEEDED(), 'NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION', 'NO_ENGINE_SUBSTITUTION') INTO @sqlmode;
 SET SESSION sql_mode = @sqlmode;
 
+-- GENERIC START
+
 --
 -- Table structure for table `aggregate_graph_templates`
 --
